@@ -59,5 +59,5 @@ async def export_pdf():
     pdf.output(filename)
     return FileResponse(filename, media_type="application/pdf", filename=filename)
     @app.get("/")
-def root():
-    return {"status": "Report Magic API is running 🚀"}
+    def root():
+        return {"status": "Report Magic API is running 🚀"}
