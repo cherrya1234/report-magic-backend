@@ -8,7 +8,13 @@ import openai
 from fpdf import FPDF
 import os
 
+from fastapi import FastAPI
 app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"message": "✅ Report Magic API is running!"}
+    
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 datasets = {}
@@ -58,6 +64,4 @@ async def export_pdf():
     filename = "report.pdf"
     pdf.output(filename)
     return FileResponse(filename, media_type="application/pdf", filename=filename)
-    @app.get("/")
-    def root():
-        return {"status": "Report Magic API is running 🚀"}
+
