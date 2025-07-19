@@ -24,8 +24,16 @@ qa_answers = []
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 @app.post("/api/upload")
-async def upload_excel_files(files: List[UploadFile] = File(...)):
+async def upload_excel_files(
+    files: List[UploadFile] = File(...),
+    session_id: str = Form(None)
+):
+    if session_id is None:
+        session_id = str(uuid.uuid4())
+    
     results = {}
+    dfs = {}
+    
     global datasets, summary_text
     datasets.clear()
     summary_text = ""
@@ -46,8 +54,14 @@ async def upload_excel_files(files: List[UploadFile] = File(...)):
 
         except Exception as e:
             results[file.filename] = {"error": str(e)}
-
-    return {"status": "success", "files": results}
+        
+    session_store[session_id] = dfs
+    
+     return {
+        "status": "success",
+        "session_id": session_id,
+        "files": results
+    }
     
 @app.post("/api/ask")
 async def ask(data: dict):
