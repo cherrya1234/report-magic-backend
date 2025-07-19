@@ -4,3 +4,4 @@ openai
 pandas
 fpdf
 python-multipart
+openpyxl
