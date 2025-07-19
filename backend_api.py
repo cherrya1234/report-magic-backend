@@ -32,10 +32,23 @@ async def upload_excel_files(files: List[UploadFile] = File(...)):
     for file in files:
         contents = await file.read()
         df = pd.read_excel(io.BytesIO(contents))
-        datasets[file.filename] = df
-    summary_text = "\n\n".join([f"{name}: {df.shape[0]} rows, {df.shape[1]} columns\nColumns: {', '.join(df.columns)}" for name, df in datasets.items()])
-    return {"summary": summary_text}
+       
+        summary = {
+                "filename": file.filename,
+                "shape": df.shape,
+                "columns": df.columns.tolist(),
+                "missing_values": df.isnull().sum().to_dict(),
+                "dtypes": df.dtypes.astype(str).to_dict(),
+                "preview": df.head(5).to_dict(orient="records")
+            }
 
+            results[file.filename] = summary
+
+        except Exception as e:
+            results[file.filename] = {"error": str(e)}
+
+    return {"status": "success", "files": results}
+    
 @app.post("/api/ask")
 async def ask(data: dict):
     global qa_answers
