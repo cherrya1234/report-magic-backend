@@ -15,7 +15,7 @@ app = FastAPI()
 def root():
     return {"message": "✅ Report Magic API is running!"}
     
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,  allow_methods=["*"], allow_headers=["*"])
 
 datasets = {}
 summary_text = ""
@@ -24,7 +24,8 @@ qa_answers = []
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 @app.post("/api/upload")
-async def upload(files: List[UploadFile] = File(...)):
+async def upload_excel_files(files: List[UploadFile] = File(...)):
+    results = {}
     global datasets, summary_text
     datasets.clear()
     summary_text = ""
