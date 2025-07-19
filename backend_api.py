@@ -34,26 +34,21 @@ async def upload_excel_files(
     results = {}
     dfs = {}
     
-    global datasets, summary_text
-    datasets.clear()
-    summary_text = ""
     for file in files:
         contents = await file.read()
         df = pd.read_excel(io.BytesIO(contents))
+        dfs[file.filename] = df
        
-        summary = {
-                "filename": file.filename,
-                "shape": df.shape,
-                "columns": df.columns.tolist(),
-                "missing_values": df.isnull().sum().to_dict(),
-                "dtypes": df.dtypes.astype(str).to_dict(),
-                "preview": df.head(5).to_dict(orient="records")
-            }
+         results[file.filename] = {
+            "shape": df.shape,
+            "columns": df.columns.tolist(),
+            "missing_values": df.isnull().sum().to_dict(),
+            "dtypes": df.dtypes.astype(str).to_dict(),
+            "preview": df.head(5).to_dict(orient="records")
+        }
 
-        results[file.filename] = summary
-
-        except Exception as e:
-            results[file.filename] = {"error": str(e)}
+    except Exception as e:
+        results[file.filename] = {"error": str(e)}
         
     session_store[session_id] = dfs
     
