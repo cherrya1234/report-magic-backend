@@ -42,7 +42,7 @@ async def upload_excel_files(files: List[UploadFile] = File(...)):
                 "preview": df.head(5).to_dict(orient="records")
             }
 
-            results[file.filename] = summary
+        results[file.filename] = summary
 
         except Exception as e:
             results[file.filename] = {"error": str(e)}
