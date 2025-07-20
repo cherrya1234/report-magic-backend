@@ -87,10 +87,16 @@ async def upload_excel_files(
 async def ask(data: dict):
     global qa_answers
     question = data.get("question", "")
-    context = ""
+    session_id = data.get("session_id")
+    dfs = session_store.get(session_id, {})
 
-    for name, df in datasets.items():
+    if not dfs:
+        return {"answer": "No data found for this session. Please upload files again."}
+
+    context = ""
+    for name, df in dfs.items():
         context += f"File: {name}\n{df.head(5).to_csv(index=False)}\n\n"
+
     prompt = f"Context:\n{context}\n\nQuestion: {question}\nAnswer:"
     
     response = openai.ChatCompletion.create(
@@ -103,7 +109,7 @@ async def ask(data: dict):
     qa_answers.append((question, answer))
     
     return {"answer": answer}
-
+    
 @app.get("/api/export")
 async def export_pdf():
     pdf = FPDF()
