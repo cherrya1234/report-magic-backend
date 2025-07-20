@@ -91,7 +91,6 @@ async def ask(data: dict):
 
     for name, df in datasets.items():
         context += f"File: {name}\n{df.head(5).to_csv(index=False)}\n\n"
-
     prompt = f"Context:\n{context}\n\nQuestion: {question}\nAnswer:"
     
     response = openai.ChatCompletion.create(
