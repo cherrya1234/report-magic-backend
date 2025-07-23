@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pandas
+openai>=1.1.0
+python-multipart
+fpdf
+openpyxl
+aiofiles
