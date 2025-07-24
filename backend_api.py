@@ -102,7 +102,9 @@ async def ask(data: dict):
     )
 
     answer = response.choices[0].message.content
-    qa_answers.append((question, answer))
+    
+    qa_answers.clear()  # Clear previous Q&A
+    qa_answers.append((question, answer))  # Store only current Q&A
 
     return {"answer": answer}
 
