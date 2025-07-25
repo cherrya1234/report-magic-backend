@@ -67,6 +67,12 @@ async def upload_excel_files(
     results = {}
     dfs = {}
 
+@app.post("/api/clear")
+async def clear_qa_history():
+    global qa_answers
+    qa_answers.clear()
+    return {"status": "cleared"}  
+
     for file in files:
         try:
             contents = await file.read()
