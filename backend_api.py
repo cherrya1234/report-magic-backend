@@ -19,7 +19,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-2")
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "report-magician-files")
 S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")  # optional
 
