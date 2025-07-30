@@ -1,4 +1,5 @@
 fastapi
-boto3
 uvicorn
+boto3
+openai
 python-multipart
