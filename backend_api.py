@@ -70,7 +70,7 @@ async def ask_question(request: Request):
             raise HTTPException(status_code=404, detail="Session not found.")
 
         response = client.chat.completions.create(
-            model="gpt-4",
+            model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3
         )
