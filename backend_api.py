@@ -31,7 +31,7 @@ async def upload_excel(
     file: UploadFile = File(...)
 ):
     session_id = str(uuid4())
-    key = f"projects/{projectName}/{session_id}/uploads/{file.filename}"
-    s3.upload_fileobj(file.file, BUCKET_NAME, key)
+    s3_key = f"projects/{project_name}/{session_id}/uploads/{unique_filename}"
+    s3.upload_fileobj(file.file, bucket_name, s3_key)
     session_data[session_id] = {"email": email, "project": projectName, "questions": []}
     return {"session_id": session_id, "s3_key": key}
