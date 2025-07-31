@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from uuid import uuid4
 import boto3
@@ -30,8 +30,26 @@ async def upload_excel(
     email: str = Form(...),
     file: UploadFile = File(...)
 ):
-    session_id = str(uuid4())
-    s3_key = f"projects/{project_name}/{session_id}/uploads/{unique_filename}"
-    s3.upload_fileobj(file.file, bucket_name, s3_key)
-    session_data[session_id] = {"email": email, "project": projectName, "questions": []}
-    return {"session_id": session_id, "s3_key": key}
+    try:
+        session_id = str(uuid4())
+        unique_filename = f"{int(uuid4().int % 1e10)}_{file.filename}"
+        s3_key = f"projects/{projectName}/{session_id}/uploads/{unique_filename}"
+
+        # Upload to S3
+        s3.upload_fileobj(file.file, BUCKET_NAME, s3_key)
+
+        # Save session data
+        session_data[session_id] = {
+            "email": email,
+            "project": projectName,
+            "questions": []
+        }
+
+        return {
+            "session_id": session_id,
+            "s3_key": s3_key
+        }
+
+    except Exception as e:
+        print("Upload error:", str(e))
+        raise HTTPException(status_code=500, detail="Upload failed.")
