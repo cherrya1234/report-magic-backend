@@ -55,6 +55,8 @@ async def upload_excel(
         print("Upload error:", str(e))
         raise HTTPException(status_code=500, detail="Upload failed.")
 
+import traceback
+
 @app.post("/api/ask")
 async def ask_question(request: Request):
     try:
