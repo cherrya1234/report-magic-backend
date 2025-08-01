@@ -4,6 +4,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from uuid import uuid4
 import boto3
 import openai
+import logging
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI()
 
