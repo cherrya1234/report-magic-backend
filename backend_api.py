@@ -82,4 +82,5 @@ async def ask_question(request: Request):
 
     except Exception as e:
         print("OpenAI error:", str(e))
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail="Error getting answer")
