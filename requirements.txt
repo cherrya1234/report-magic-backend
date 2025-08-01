@@ -1,6 +1,0 @@
-
-fastapi
-boto3
-openai>=1.0.0
-uvicorn
-python-multipart
