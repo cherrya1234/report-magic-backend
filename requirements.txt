@@ -1,0 +1,5 @@
+fastapi
+boto3
+openai==0.28.1
+uvicorn
+python-multipart
