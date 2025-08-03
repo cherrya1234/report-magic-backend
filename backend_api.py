@@ -62,17 +62,27 @@ async def upload_excel(
         raise HTTPException(status_code=500, detail="Upload failed.")
 
 @app.post("/api/ask")
-async def ask_question(request: Request):
-    try:
-        data = await request.json()
-        session_id = data.get("session_id")
-        prompt = data.get("question")
+async def ask_question(session_id: str = Body(...), question: str = Body(...)):
+    if session_id not in session_store:
+        return {"error": "Invalid session ID"}
 
-        if not session_id or not prompt:
-            raise HTTPException(status_code=400, detail="Missing session_id or question.")
+    dfs = session_store[session_id]
 
-        session_info = session_data.get(session_id, {})
+    # Convert all dataframes to markdown
+    combined_markdown = ""
+    for name, df in dfs.items():
+        combined_markdown += f"### File: {name}\n"
+        combined_markdown += df.head(20).to_markdown() + "\n\n"
 
+    prompt = f"""
+You are a data analyst. A user has uploaded multiple Excel sheets. Below is a preview of the data (20 rows max per file).
+
+{combined_markdown}
+
+Question: {question}
+
+Answer:
+"""
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
