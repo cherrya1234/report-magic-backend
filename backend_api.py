@@ -1,6 +1,6 @@
 
 import os
-import io
+import io, json
 from uuid import uuid4
 
 import boto3
@@ -48,32 +48,28 @@ def _load_df_from_s3_key(s3_client, bucket: str, key: str) -> pd.DataFrame:
     buf = io.BytesIO()
     s3_client.download_fileobj(bucket, key, buf)
     buf.seek(0)
-    return pd.read_excel(buf)  # requires openpyxl
+    return pd.read_excel(buf)  # openpyxl required
 
 def _load_merged_session_df(s3_client, bucket: str, sess: dict) -> pd.DataFrame:
     keys = sess.get("files", [])
-    if not keys:
-        return pd.DataFrame()
     dfs = []
     for k in keys:
         try:
             df = _load_df_from_s3_key(s3_client, bucket, k)
-            df["__source_file__"] = k  # keep provenance
+            df["__source_file__"] = k
             dfs.append(df)
         except Exception as e:
-            print("Failed to load", k, "error:", repr(e))
+            print("[ask] failed to load", k, e)
     if not dfs:
         return pd.DataFrame()
-    # Outer concat to union columns across sheets
-    merged = pd.concat(dfs, ignore_index=True, sort=True)
-    return merged
+    return pd.concat(dfs, ignore_index=True, sort=True)
 
 def _df_sample_csv(df: pd.DataFrame, n=20) -> str:
     if len(df) == 0:
         return ""
     return df.sample(min(n, len(df)), random_state=42).to_csv(index=False)
 
-def _df_profile(df: pd.DataFrame, max_cats_cols=8) -> str:
+def _df_profile(df: pd.DataFrame) -> str:
     parts = []
     parts.append("SCHEMA:")
     for col in df.columns:
@@ -81,57 +77,148 @@ def _df_profile(df: pd.DataFrame, max_cats_cols=8) -> str:
     num = df.select_dtypes(include=["number"])
     if not num.empty:
         parts.append("\nNUMERIC_SUMMARY=" + str(num.describe().round(3).to_dict()))
-    # brief categorical peek
     cat = df.select_dtypes(exclude=["number"])
     if not cat.empty:
         cats = {}
-        for c in cat.columns[:max_cats_cols]:
+        for c in cat.columns[:8]:
             cats[c] = cat[c].astype(str).value_counts().head(5).to_dict()
         parts.append("\nCATEGORICAL_TOP_VALUES=" + str(cats))
     return "\n".join(parts)
 
-# -------- Health --------
-@app.get("/")
-def health():
-    return {"ok": True, "service": "Report Magician backend (merged files)"}
+# ---- safe pandas executor over a very small plan ----
+ALLOWED_AGGS = {"count", "sum", "mean", "avg", "median", "min", "max", "nunique"}
+RENAME_AGG = {"avg": "mean"}
 
-# -------- Upload (supports multiple files) --------
-@app.post("/api/upload")
-async def upload_excel(
-    projectName: str = Form(...),
-    email: str = Form(...),
-    file: UploadFile = File(...),
-    session_id: str | None = Form(None),
-):
-    try:
-        # Reuse session if provided; otherwise create new
-        if not session_id:
-            session_id = str(uuid4())
+def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
+    out = df.copy()
+    for f in filters or []:
+        col = f.get("column")
+        op  = f.get("op")
+        val = f.get("value")
+        if col not in out.columns:
+            continue
+        series = out[col]
+        # simple ops only
+        if op in ("eq", "=="):
+            out = out[series.astype(str).str.lower() == str(val).lower()]
+        elif op in ("ne", "!="):
+            out = out[series.astype(str).str.lower() != str(val).lower()]
+        elif op in (">", "gt"):
+            out = out[pd.to_numeric(series, errors="coerce") > pd.to_numeric(val, errors="coerce")]
+        elif op in ("<", "lt"):
+            out = out[pd.to_numeric(series, errors="coerce") < pd.to_numeric(val, errors="coerce")]
+        elif op in ("contains", "icontains"):
+            out = out[series.astype(str).str.contains(str(val), case=False, na=False)]
+        elif op in ("between",):
+            lo = f.get("low"); hi = f.get("high")
+            s = pd.to_numeric(series, errors="coerce")
+            out = out[(s >= pd.to_numeric(lo, errors="coerce")) & (s <= pd.to_numeric(hi, errors="coerce"))]
+        elif op in ("date_between",):
+            s = pd.to_datetime(series, errors="coerce")
+            start = pd.to_datetime(f.get("start"), errors="coerce")
+            end   = pd.to_datetime(f.get("end"),   errors="coerce")
+            out = out[(s >= start) & (s <= end)]
+        # ignore unsupported ops silently
+    return out
 
-        unique_filename = f"{int(uuid4().int % 1e10)}_{file.filename}"
-        s3_key = f"projects/{projectName}/{session_id}/uploads/{unique_filename}"
+def _execute_plan(df: pd.DataFrame, plan: dict) -> tuple[str, pd.DataFrame | None]:
+    """
+    Plan schema (example):
+    {
+      "task": "aggregate",  # or "list_rows", "topk", "pivot"
+      "filters": [{"column":"Unit Size","op":"eq","value":"10x10"}],
+      "groupby": ["City"],
+      "metrics": [{"agg":"mean","column":"Rent","alias":"avg_rent"}],
+      "limit": 50,
+      "sort": [{"column":"avg_rent","direction":"desc"}]
+    }
+    """
+    task = (plan.get("task") or "aggregate").lower()
+    filters = plan.get("filters") or []
+    gby = plan.get("groupby") or []
+    metrics = plan.get("metrics") or []
+    limit = int(plan.get("limit") or 50)
+    sort  = plan.get("sort") or []
 
-        file.file.seek(0)
-        s3.upload_fileobj(file.file, BUCKET_NAME, s3_key)
+    work = _apply_filters(df, filters)
 
-        sess = session_data.setdefault(session_id, {
-            "email": email,
-            "project": projectName,
-            "questions": [],
-            "files": []
-        })
-        # Update email/project if provided again
-        sess["email"] = email or sess.get("email")
-        sess["project"] = projectName or sess.get("project")
+    # Ensure dtypes usable
+    for m in metrics:
+        col = m.get("column")
+        if col and col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="ignore")
 
-        sess["files"].append(s3_key)
+    if task in ("list_rows", "rows"):
+        out = work[gby or work.columns].head(limit)
+        return (f"Showing up to {len(out)} row(s).", out)
 
-        return {"session_id": session_id, "s3_key": s3_key}
-    except Exception as e:
-        print("Upload error:", repr(e))
-        raise HTTPException(status_code=500, detail="Upload failed.")
+    if task in ("aggregate", "groupby", "summarize", "summary"):
+        if gby:
+            gb = work.groupby(gby, dropna=False)
+        else:
+            gb = None
 
-# -------- Ask (rewrite to analyst brief, then grounded answer) --------
+        agg_map = {}
+        for m in metrics:
+            agg = (m.get("agg") or "").lower()
+            agg = RENAME_AGG.get(agg, agg)
+            col = m.get("column")
+            if agg not in ALLOWED_AGGS:
+                continue
+            if agg == "count" and (not col or col == "*"):
+                # count rows
+                if gb is None:
+                    out = pd.DataFrame({"count": [len(work)]})
+                else:
+                    out = gb.size().reset_index(name="count")
+                # optional sort/limit
+                if sort:
+                    for s in sort:
+                        out = out.sort_values(by=s["column"], ascending=(s.get("direction","asc")=="asc"))
+                return ("Computed counts.", out.head(limit))
+            if col and col in work.columns:
+                agg_map.setdefault(col, []).append(agg)
+
+        if not agg_map:
+            # default to row count
+            if gb is None:
+                out = pd.DataFrame({"count": [len(work)]})
+            else:
+                out = gb.size().reset_index(name="count")
+            if sort:
+                for s in sort:
+                    out = out.sort_values(by=s["column"], ascending=(s.get("direction","asc")=="asc"))
+            return ("Computed counts.", out.head(limit))
+
+        if gb is None:
+            out = work.agg(agg_map)
+            # flatten columns if multiindex
+            if isinstance(out, pd.Series):
+                out = out.to_frame().T
+            else:
+                out.columns = ["_".join(c).strip() if isinstance(c, tuple) else c for c in out.columns]
+            msg = "Computed summary metrics."
+        else:
+            out = gb.agg(agg_map).reset_index()
+            out.columns = ["_".join(c).strip() if isinstance(c, tuple) else c for c in out.columns]
+            msg = "Computed grouped summary metrics."
+        if sort:
+            for s in sort:
+                out = out.sort_values(by=s["column"], ascending=(s.get("direction","asc")=="asc"))
+        return (msg, out.head(limit))
+
+    if task in ("topk", "rank"):
+        k = int(plan.get("k") or 10)
+        rank_by = plan.get("rank_by")
+        if rank_by and rank_by in work.columns:
+            out = work.sort_values(by=rank_by, ascending=False).head(k)
+            return (f"Top {k} by {rank_by}.", out)
+        return ("Ranking failed: missing rank_by column.", None)
+
+    # default: list a few rows
+    out = work.head(limit)
+    return (f"Showing up to {len(out)} row(s).", out)
+
 @app.post("/api/ask")
 async def ask_question(request: Request):
     try:
@@ -146,106 +233,96 @@ async def ask_question(request: Request):
         if not sess or not sess.get("files"):
             raise HTTPException(status_code=400, detail="No files found for this session.")
 
-        # Load and merge all session files
+        # 1) load merged data
         df = _load_merged_session_df(s3, BUCKET_NAME, sess)
         if df.empty:
             raise HTTPException(status_code=400, detail="Could not load any data from uploaded files.")
 
-        profile = _df_profile(df)
-        sample_csv = _df_sample_csv(df, n=20)
-
-        # 1) Rewrite question to analyst brief (internal)
-        rewrite_system = (
-            "You are a senior data analyst. Rewrite the user's question into a concise analysis brief with:
-"
-            "- objective(s)
-- metric(s)
-- filters/segments (if any)
-- grouping/dimensions (if any)
-- timeframe (if mentioned)
-"
-            "- explicit assumptions when unspecified
-Return only the brief."
+        # 2) LLM planner → produce a tiny JSON plan
+        cols = list(df.columns)
+        planner_system = (
+            "You are a senior data analyst. Convert the user's question into a SMALL JSON plan "
+            "that can be executed with pandas. Use only these keys: "
+            "task, filters, groupby, metrics, limit, sort, k, rank_by. "
+            "Allowed tasks: aggregate, list_rows, topk. "
+            "Allowed aggs: count, sum, mean, avg, median, min, max, nunique. "
+            "Filters are case-insensitive for text. If question is descriptive, return task=list_rows."
+            "IMPORTANT: Return ONLY valid JSON, no backticks, no commentary."
         )
-        rw = openai.ChatCompletion.create(
+        planner_user = (
+            f"AVAILABLE_COLUMNS = {cols}\n\n"
+            f"QUESTION = {user_q}\n\n"
+            "Example output:\n"
+            "{\n"
+            '  "task": "aggregate",\n'
+            '  "filters": [{"column":"Unit Size","op":"eq","value":"10x10"}],\n'
+            '  "groupby": ["City"],\n'
+            '  "metrics": [{"agg":"mean","column":"Rent","alias":"avg_rent"}],\n'
+            '  "limit": 50,\n'
+            '  "sort": [{"column":"avg_rent","direction":"desc"}]\n'
+            "}"
+        )
+        plan_resp = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             temperature=0.0,
             messages=[
-                {"role": "system", "content": rewrite_system},
-                {"role": "user", "content": f"User question:\n{user_q}"},
+                {"role": "system", "content": planner_system},
+                {"role": "user", "content": planner_user},
             ],
         )
-        analyst_brief = rw["choices"][0]["message"]["content"]
+        plan_text = plan_resp["choices"][0]["message"]["content"].strip()
+        try:
+            plan = json.loads(plan_text)
+        except Exception:
+            # If it returns text, fallback to descriptive answer later
+            plan = {"task": "fallback"}
 
-        # 2) Answer using only profile + sample
-        answer_system = (
-            "You are a precise data analyst. Use ONLY the provided data profile and sample rows to answer. "
-            "If information is missing, state exactly what columns or steps are needed. "
-            "Keep steps short; give a clear, actionable answer."
+        # 3) Try to execute the plan safely
+        table = None
+        summary_msg = None
+        if plan.get("task") != "fallback":
+            summary_msg, table = _execute_plan(df, plan)
+
+        # 4) If we got a table or a summary, craft a concise answer
+        if table is not None:
+            # Make a compact CSV for display-sized results
+            preview_rows = min(len(table), 50)
+            csv_preview = table.head(preview_rows).to_csv(index=False)
+            answer = summary_msg or "Computed result."
+            # store Q&A + attach tiny preview as code block
+            full_answer = f"{answer}\n\nPreview (first {preview_rows} rows):\n```\n{csv_preview}\n```"
+            sess.setdefault("questions", [])
+            sess["questions"].append({"question": user_q, "answer": full_answer})
+            return {"answer": full_answer}
+
+        # 5) Fallback: grounded LLM answer using profile + sample
+        profile = _df_profile(df)
+        sample_csv = _df_sample_csv(df, n=20)
+        system_msg = (
+            "You are a precise data analyst. Use ONLY the provided data profile and sample rows. "
+            "If data is insufficient, say exactly which columns or steps are needed."
         )
-        user_context = (
-            f"DATA PROFILE\n{profile}\n\n"
-            f"SAMPLE ROWS (CSV, up to 20)\n{sample_csv}\n\n"
-            f"ANALYST BRIEF (internal)\n{analyst_brief}\n\n"
-            f"TASK\nAnswer the brief using only the profile and sample."
+        user_ctx = (
+            f"DATA PROFILE:\n{profile}\n\n"
+            f"SAMPLE ROWS (CSV, up to 20):\n{sample_csv}\n\n"
+            f"QUESTION (verbatim from user):\n{user_q}"
         )
         resp = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             temperature=0.2,
             messages=[
-                {"role": "system", "content": answer_system},
-                {"role": "user", "content": user_context},
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_ctx},
             ],
         )
         answer = resp["choices"][0]["message"]["content"]
-
-        # Store only Q&A
         sess.setdefault("questions", [])
         sess["questions"].append({"question": user_q, "answer": answer})
-
         return {"answer": answer}
+
     except HTTPException:
         raise
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"ask failed: {type(e).__name__}: {e}")
-
-# -------- Export (answers only) --------
-@app.get("/api/export")
-async def export_pdf(session_id: str):
-    sess = session_data.get(session_id)
-    if not sess:
-        raise HTTPException(status_code=400, detail="Invalid session_id")
-
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=12)
-
-    # Header
-    pdf.set_font("Arial", "B", 14)
-    pdf.cell(0, 10, "Report Magician — Q&A Summary", ln=True)
-    pdf.set_font("Arial", size=11)
-    pdf.cell(0, 8, f"Project: {sess.get('project','')}", ln=True)
-    pdf.cell(0, 8, f"Email: {sess.get('email','')}", ln=True)
-    pdf.ln(4)
-
-    # Q&A (answers only)
-    qa_list = sess.get("questions", [])
-    if not qa_list:
-        pdf.set_font("Arial", size=12)
-        pdf.multi_cell(0, 8, "No questions asked in this session.")
-    else:
-        pdf.set_font("Arial", "B", 12)
-        pdf.cell(0, 10, "Q&A", ln=True)
-        pdf.set_font("Arial", size=12)
-        for i, qa in enumerate(qa_list, 1):
-            q = qa.get("question", "")
-            a = qa.get("answer", "")
-            pdf.multi_cell(0, 8, f"{i}. Q: {q}")
-            pdf.multi_cell(0, 8, f"   A: {a}")
-            pdf.ln(2)
-
-    fname = f"report_{session_id}.pdf"
-    pdf.output(fname)
-    return FileResponse(fname, media_type="application/pdf", filename=fname)
