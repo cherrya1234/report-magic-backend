@@ -1,6 +1,4 @@
-
-import os
-import io, json
+import os, io, json
 from uuid import uuid4
 
 import boto3
@@ -11,25 +9,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fpdf import FPDF
 
-# -------- App & CORS --------
+# =========================
+# App & CORS (allow all origins, no credentials)
+# =========================
 app = FastAPI()
-
-ALLOWED_ORIGINS = [
-    "https://report-magician-frontend.vercel.app",
-    "http://localhost:5173",
-    "http://localhost:3000",
-]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=["*"],          # broad: works for vercel preview domains too
+    allow_credentials=False,      # must be False when using "*"
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+    max_age=86400,
 )
 
-# -------- Env / Clients --------
-BUCKET_NAME = "report-magician-files"
+# =========================
+# Env/Clients
+# =========================
+BUCKET_NAME = os.getenv("S3_BUCKET", "report-magician-files")
 
 s3 = boto3.client(
     "s3",
@@ -40,10 +38,12 @@ s3 = boto3.client(
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# In-memory session store
+# In-memory store (for demo/memory mode)
 session_data = {}
 
-# -------- Utilities --------
+# =========================
+# Helpers: load & merge
+# =========================
 def _load_df_from_s3_key(s3_client, bucket: str, key: str) -> pd.DataFrame:
     buf = io.BytesIO()
     s3_client.download_fileobj(bucket, key, buf)
@@ -85,7 +85,9 @@ def _df_profile(df: pd.DataFrame) -> str:
         parts.append("\nCATEGORICAL_TOP_VALUES=" + str(cats))
     return "\n".join(parts)
 
-# ---- safe pandas executor over a very small plan ----
+# =========================
+# Safe pandas executor (tiny plan)
+# =========================
 ALLOWED_AGGS = {"count", "sum", "mean", "avg", "median", "min", "max", "nunique"}
 RENAME_AGG = {"avg": "mean"}
 
@@ -98,7 +100,6 @@ def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
         if col not in out.columns:
             continue
         series = out[col]
-        # simple ops only
         if op in ("eq", "=="):
             out = out[series.astype(str).str.lower() == str(val).lower()]
         elif op in ("ne", "!="):
@@ -118,21 +119,9 @@ def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
             start = pd.to_datetime(f.get("start"), errors="coerce")
             end   = pd.to_datetime(f.get("end"),   errors="coerce")
             out = out[(s >= start) & (s <= end)]
-        # ignore unsupported ops silently
     return out
 
 def _execute_plan(df: pd.DataFrame, plan: dict) -> tuple[str, pd.DataFrame | None]:
-    """
-    Plan schema (example):
-    {
-      "task": "aggregate",  # or "list_rows", "topk", "pivot"
-      "filters": [{"column":"Unit Size","op":"eq","value":"10x10"}],
-      "groupby": ["City"],
-      "metrics": [{"agg":"mean","column":"Rent","alias":"avg_rent"}],
-      "limit": 50,
-      "sort": [{"column":"avg_rent","direction":"desc"}]
-    }
-    """
     task = (plan.get("task") or "aggregate").lower()
     filters = plan.get("filters") or []
     gby = plan.get("groupby") or []
@@ -142,7 +131,6 @@ def _execute_plan(df: pd.DataFrame, plan: dict) -> tuple[str, pd.DataFrame | Non
 
     work = _apply_filters(df, filters)
 
-    # Ensure dtypes usable
     for m in metrics:
         col = m.get("column")
         if col and col in work.columns:
@@ -166,12 +154,10 @@ def _execute_plan(df: pd.DataFrame, plan: dict) -> tuple[str, pd.DataFrame | Non
             if agg not in ALLOWED_AGGS:
                 continue
             if agg == "count" and (not col or col == "*"):
-                # count rows
                 if gb is None:
                     out = pd.DataFrame({"count": [len(work)]})
                 else:
                     out = gb.size().reset_index(name="count")
-                # optional sort/limit
                 if sort:
                     for s in sort:
                         out = out.sort_values(by=s["column"], ascending=(s.get("direction","asc")=="asc"))
@@ -180,7 +166,6 @@ def _execute_plan(df: pd.DataFrame, plan: dict) -> tuple[str, pd.DataFrame | Non
                 agg_map.setdefault(col, []).append(agg)
 
         if not agg_map:
-            # default to row count
             if gb is None:
                 out = pd.DataFrame({"count": [len(work)]})
             else:
@@ -192,7 +177,6 @@ def _execute_plan(df: pd.DataFrame, plan: dict) -> tuple[str, pd.DataFrame | Non
 
         if gb is None:
             out = work.agg(agg_map)
-            # flatten columns if multiindex
             if isinstance(out, pd.Series):
                 out = out.to_frame().T
             else:
@@ -215,9 +199,51 @@ def _execute_plan(df: pd.DataFrame, plan: dict) -> tuple[str, pd.DataFrame | Non
             return (f"Top {k} by {rank_by}.", out)
         return ("Ranking failed: missing rank_by column.", None)
 
-    # default: list a few rows
     out = work.head(limit)
     return (f"Showing up to {len(out)} row(s).", out)
+
+# =========================
+# Routes
+# =========================
+@app.get("/")
+def health():
+    return {"ok": True, "service": "Report Magician backend (CORS all)"}
+
+@app.post("/api/upload")
+async def upload_excel(
+    projectName: str = Form(...),
+    email: str = Form(...),
+    file: UploadFile = File(...),
+    session_id: str | None = Form(None),
+):
+    try:
+        if not session_id:
+            session_id = str(uuid4())
+
+        unique_filename = f"{int(uuid4().int % 1e10)}_{file.filename}"
+        s3_key = f"projects/{projectName}/{session_id}/uploads/{unique_filename}"
+
+        file.file.seek(0)
+        s3.upload_fileobj(file.file, BUCKET_NAME, s3_key)
+
+        # verify exists
+        s3.head_object(Bucket=BUCKET_NAME, Key=s3_key)
+
+        sess = session_data.setdefault(session_id, {
+            "email": email,
+            "project": projectName,
+            "questions": [],
+            "files": []
+        })
+        sess["email"] = email or sess.get("email")
+        sess["project"] = projectName or sess.get("project")
+        sess["files"].append(s3_key)
+
+        print(f"[upload] session={session_id} s3_key={s3_key}")
+        return {"session_id": session_id, "s3_key": s3_key}
+    except Exception as e:
+        print("Upload error:", repr(e))
+        raise HTTPException(status_code=500, detail="Upload failed.")
 
 @app.post("/api/ask")
 async def ask_question(request: Request):
@@ -233,12 +259,10 @@ async def ask_question(request: Request):
         if not sess or not sess.get("files"):
             raise HTTPException(status_code=400, detail="No files found for this session.")
 
-        # 1) load merged data
         df = _load_merged_session_df(s3, BUCKET_NAME, sess)
         if df.empty:
             raise HTTPException(status_code=400, detail="Could not load any data from uploaded files.")
 
-        # 2) LLM planner → produce a tiny JSON plan
         cols = list(df.columns)
         planner_system = (
             "You are a senior data analyst. Convert the user's question into a SMALL JSON plan "
@@ -274,28 +298,22 @@ async def ask_question(request: Request):
         try:
             plan = json.loads(plan_text)
         except Exception:
-            # If it returns text, fallback to descriptive answer later
             plan = {"task": "fallback"}
 
-        # 3) Try to execute the plan safely
         table = None
         summary_msg = None
         if plan.get("task") != "fallback":
             summary_msg, table = _execute_plan(df, plan)
 
-        # 4) If we got a table or a summary, craft a concise answer
         if table is not None:
-            # Make a compact CSV for display-sized results
             preview_rows = min(len(table), 50)
             csv_preview = table.head(preview_rows).to_csv(index=False)
             answer = summary_msg or "Computed result."
-            # store Q&A + attach tiny preview as code block
             full_answer = f"{answer}\n\nPreview (first {preview_rows} rows):\n```\n{csv_preview}\n```"
             sess.setdefault("questions", [])
             sess["questions"].append({"question": user_q, "answer": full_answer})
             return {"answer": full_answer}
 
-        # 5) Fallback: grounded LLM answer using profile + sample
         profile = _df_profile(df)
         sample_csv = _df_sample_csv(df, n=20)
         system_msg = (
@@ -326,3 +344,39 @@ async def ask_question(request: Request):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"ask failed: {type(e).__name__}: {e}")
+
+@app.get("/api/export")
+async def export_pdf(session_id: str):
+    sess = session_data.get(session_id)
+    if not sess:
+        raise HTTPException(status_code=400, detail="Invalid session_id")
+
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=12)
+
+    pdf.set_font("Arial", "B", 14)
+    pdf.cell(0, 10, "Report Magician — Q&A Summary", ln=True)
+    pdf.set_font("Arial", size=11)
+    pdf.cell(0, 8, f"Project: {sess.get('project','')}", ln=True)
+    pdf.cell(0, 8, f"Email: {sess.get('email','')}", ln=True)
+    pdf.ln(4)
+
+    qa_list = sess.get("questions", [])
+    if not qa_list:
+        pdf.set_font("Arial", size=12)
+        pdf.multi_cell(0, 8, "No questions asked in this session.")
+    else:
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(0, 10, "Q&A", ln=True)
+        pdf.set_font("Arial", size=12)
+        for i, qa in enumerate(qa_list, 1):
+            q = qa.get("question", "")
+            a = qa.get("answer", "")
+            pdf.multi_cell(0, 8, f"{i}. Q: {q}")
+            pdf.multi_cell(0, 8, f"   A: {a}")
+            pdf.ln(2)
+
+    fname = f"report_{session_id}.pdf"
+    pdf.output(fname)
+    return FileResponse(fname, media_type="application/pdf", filename=fname)
