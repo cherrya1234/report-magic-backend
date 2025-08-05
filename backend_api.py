@@ -1,13 +1,20 @@
-import os, io, json
+import os, io, json, sys
 from uuid import uuid4
 
 import boto3
-import openai  # legacy SDK 0.28.1
+import openai  # legacy SDK 0.28.1 (pinned in requirements)
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fpdf import FPDF
+
+# =========================
+# Config
+# =========================
+DEBUG_PLANNER = True          # print plan + columns
+PLANNER_RETRIES = 1           # retry once if invalid JSON
+MAX_PREVIEW_ROWS = 50
 
 # =========================
 # App & CORS (allow all origins, no credentials)
@@ -17,7 +24,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],          # broad: works for vercel preview domains too
-    allow_credentials=False,      # must be False when using "*"
+    allow_credentials=False,      # must be False with "*"
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
@@ -48,7 +55,8 @@ def _load_df_from_s3_key(s3_client, bucket: str, key: str) -> pd.DataFrame:
     buf = io.BytesIO()
     s3_client.download_fileobj(bucket, key, buf)
     buf.seek(0)
-    return pd.read_excel(buf)  # openpyxl required
+    # Use openpyxl engine implicitly for .xlsx
+    return pd.read_excel(buf)
 
 def _load_merged_session_df(s3_client, bucket: str, sess: dict) -> pd.DataFrame:
     keys = sess.get("files", [])
@@ -59,10 +67,11 @@ def _load_merged_session_df(s3_client, bucket: str, sess: dict) -> pd.DataFrame:
             df["__source_file__"] = k
             dfs.append(df)
         except Exception as e:
-            print("[ask] failed to load", k, e)
+            print("[ask] failed to load", k, repr(e), file=sys.stderr)
     if not dfs:
         return pd.DataFrame()
-    return pd.concat(dfs, ignore_index=True, sort=True)
+    merged = pd.concat(dfs, ignore_index=True, sort=True)
+    return merged
 
 def _df_sample_csv(df: pd.DataFrame, n=20) -> str:
     if len(df) == 0:
@@ -73,7 +82,11 @@ def _df_profile(df: pd.DataFrame) -> str:
     parts = []
     parts.append("SCHEMA:")
     for col in df.columns:
-        parts.append(f"- {col}: dtype={str(df[col].dtype)}, nulls={int(df[col].isna().sum())}")
+        try:
+            nulls = int(df[col].isna().sum())
+        except Exception:
+            nulls = 0
+        parts.append(f"- {col}: dtype={str(df[col].dtype)}, nulls={nulls}")
     num = df.select_dtypes(include=["number"])
     if not num.empty:
         parts.append("\nNUMERIC_SUMMARY=" + str(num.describe().round(3).to_dict()))
@@ -84,6 +97,49 @@ def _df_profile(df: pd.DataFrame) -> str:
             cats[c] = cat[c].astype(str).value_counts().head(5).to_dict()
         parts.append("\nCATEGORICAL_TOP_VALUES=" + str(cats))
     return "\n".join(parts)
+
+# =========================
+# Column normalization / matching
+# =========================
+def _normalize(name: str) -> str:
+    return "".join(ch for ch in name.strip().lower() if ch.isalnum() or ch == "_")
+
+def _column_alias_map(columns: list[str]) -> dict:
+    """
+    Builds a map normalized_name -> actual_column for fuzzy matching
+    e.g., "Unit Size" -> "unitsize" and also "unit_size" -> "unitsize".
+    """
+    aliases = {}
+    for c in columns:
+        aliases[_normalize(c)] = c
+        aliases[_normalize(c.replace(" ", "_"))] = c
+    return aliases
+
+def _remap_plan_columns(plan: dict, alias_map: dict) -> dict:
+    """Remap plan filters/groupby/metrics column names via alias_map if needed."""
+    def map_col(name: str | None) -> str | None:
+        if not name:
+            return name
+        key = _normalize(name)
+        return alias_map.get(key, name)
+
+    out = json.loads(json.dumps(plan))  # deep copy
+    # filters
+    for f in out.get("filters", []) or []:
+        f["column"] = map_col(f.get("column"))
+    # groupby
+    if isinstance(out.get("groupby"), list):
+        out["groupby"] = [map_col(g) for g in out["groupby"]]
+    # metrics
+    for m in out.get("metrics", []) or []:
+        m["column"] = map_col(m.get("column"))
+    # sort
+    for s in out.get("sort", []) or []:
+        s["column"] = map_col(s.get("column"))
+    # rank_by
+    if out.get("rank_by"):
+        out["rank_by"] = map_col(out["rank_by"])
+    return out
 
 # =========================
 # Safe pandas executor (tiny plan)
@@ -97,7 +153,7 @@ def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
         col = f.get("column")
         op  = f.get("op")
         val = f.get("value")
-        if col not in out.columns:
+        if not col or col not in out.columns:
             continue
         series = out[col]
         if op in ("eq", "=="):
@@ -207,7 +263,7 @@ def _execute_plan(df: pd.DataFrame, plan: dict) -> tuple[str, pd.DataFrame | Non
 # =========================
 @app.get("/")
 def health():
-    return {"ok": True, "service": "Report Magician backend (CORS all)"}
+    return {"ok": True, "service": "Report Magician backend (debug planner)"}
 
 @app.post("/api/upload")
 async def upload_excel(
@@ -225,9 +281,7 @@ async def upload_excel(
 
         file.file.seek(0)
         s3.upload_fileobj(file.file, BUCKET_NAME, s3_key)
-
-        # verify exists
-        s3.head_object(Bucket=BUCKET_NAME, Key=s3_key)
+        s3.head_object(Bucket=BUCKET_NAME, Key=s3_key)  # verify
 
         sess = session_data.setdefault(session_id, {
             "email": email,
@@ -242,7 +296,7 @@ async def upload_excel(
         print(f"[upload] session={session_id} s3_key={s3_key}")
         return {"session_id": session_id, "s3_key": s3_key}
     except Exception as e:
-        print("Upload error:", repr(e))
+        print("Upload error:", repr(e), file=sys.stderr)
         raise HTTPException(status_code=500, detail="Upload failed.")
 
 @app.post("/api/ask")
@@ -263,57 +317,90 @@ async def ask_question(request: Request):
         if df.empty:
             raise HTTPException(status_code=400, detail="Could not load any data from uploaded files.")
 
-        cols = list(df.columns)
-        planner_system = (
-            "You are a senior data analyst. Convert the user's question into a SMALL JSON plan "
-            "that can be executed with pandas. Use only these keys: "
-            "task, filters, groupby, metrics, limit, sort, k, rank_by. "
-            "Allowed tasks: aggregate, list_rows, topk. "
-            "Allowed aggs: count, sum, mean, avg, median, min, max, nunique. "
-            "Filters are case-insensitive for text. If question is descriptive, return task=list_rows."
-            "IMPORTANT: Return ONLY valid JSON, no backticks, no commentary."
-        )
-        planner_user = (
-            f"AVAILABLE_COLUMNS = {cols}\n\n"
-            f"QUESTION = {user_q}\n\n"
-            "Example output:\n"
-            "{\n"
-            '  "task": "aggregate",\n'
-            '  "filters": [{"column":"Unit Size","op":"eq","value":"10x10"}],\n'
-            '  "groupby": ["City"],\n'
-            '  "metrics": [{"agg":"mean","column":"Rent","alias":"avg_rent"}],\n'
-            '  "limit": 50,\n'
-            '  "sort": [{"column":"avg_rent","direction":"desc"}]\n'
-            "}"
-        )
-        plan_resp = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            temperature=0.0,
-            messages=[
-                {"role": "system", "content": planner_system},
-                {"role": "user", "content": planner_user},
-            ],
-        )
-        plan_text = plan_resp["choices"][0]["message"]["content"].strip()
-        try:
-            plan = json.loads(plan_text)
-        except Exception:
-            plan = {"task": "fallback"}
+        # Debug: show shape + few rows
+        print(f"[ask] session={session_id} merged shape={df.shape}", file=sys.stderr)
+        print("[ask] head:\n" + df.head(5).to_string(index=False), file=sys.stderr)
 
+        # Column normalization / aliasing
+        cols = list(df.columns)
+        alias_map = _column_alias_map([c for c in cols if c != "__source_file__"])
+
+        if DEBUG_PLANNER:
+            print("[planner] available columns:", cols, file=sys.stderr)
+
+        # === 1) Try to get a JSON plan from the model (with retry) ===
+        def plan_once() -> dict | None:
+            planner_system = (
+                "You are a senior data analyst. Convert the user's question into a SMALL JSON plan "
+                "that can be executed with pandas. Use only these keys: "
+                "task, filters, groupby, metrics, limit, sort, k, rank_by. "
+                "Allowed tasks: aggregate, list_rows, topk. "
+                "Allowed aggs: count, sum, mean, avg, median, min, max, nunique. "
+                "Filters are case-insensitive for text. If question is descriptive, return task=list_rows. "
+                "IMPORTANT: Return ONLY valid JSON, no backticks, no commentary."
+            )
+            planner_user = (
+                f"AVAILABLE_COLUMNS = {list(alias_map.values())}\n\n"
+                f"QUESTION = {user_q}\n\n"
+                "Example output:\n"
+                "{\n"
+                '  "task": "aggregate",\n'
+                '  "filters": [{"column":"Unit Size","op":"eq","value":"10x10"}],\n'
+                '  "groupby": ["City"],\n'
+                '  "metrics": [{"agg":"mean","column":"Rent","alias":"avg_rent"}],\n'
+                '  "limit": 50,\n'
+                '  "sort": [{"column":"avg_rent","direction":"desc"}]\n'
+                "}"
+            )
+            resp = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                temperature=0.0,
+                messages=[
+                    {"role": "system", "content": planner_system},
+                    {"role": "user", "content": planner_user},
+                ],
+            )
+            text = resp["choices"][0]["message"]["content"].strip()
+            if DEBUG_PLANNER:
+                print("[planner] raw plan text:", text, file=sys.stderr)
+            try:
+                return json.loads(text)
+            except Exception:
+                return None
+
+        plan = plan_once()
+        if plan is None and PLANNER_RETRIES > 0:
+            if DEBUG_PLANNER:
+                print("[planner] retrying once due to invalid JSON", file=sys.stderr)
+            plan = plan_once()
+
+        used_fallback = False
         table = None
         summary_msg = None
-        if plan.get("task") != "fallback":
-            summary_msg, table = _execute_plan(df, plan)
+        if plan:
+            # Remap column names to real ones (normalize)
+            plan = _remap_plan_columns(plan, alias_map)
+            if DEBUG_PLANNER:
+                print("[planner] final plan:", json.dumps(plan, indent=2), file=sys.stderr)
+            try:
+                summary_msg, table = _execute_plan(df, plan)
+            except Exception as e:
+                print("[planner] execute failed:", repr(e), file=sys.stderr)
+                used_fallback = True
+        else:
+            used_fallback = True
 
-        if table is not None:
-            preview_rows = min(len(table), 50)
+        # === 2) If we got a table, answer with preview ===
+        if (table is not None) and (not table.empty):
+            preview_rows = min(len(table), MAX_PREVIEW_ROWS)
             csv_preview = table.head(preview_rows).to_csv(index=False)
             answer = summary_msg or "Computed result."
             full_answer = f"{answer}\n\nPreview (first {preview_rows} rows):\n```\n{csv_preview}\n```"
-            sess.setdefault("questions", [])
-            sess["questions"].append({"question": user_q, "answer": full_answer})
+            sess.setdefault("questions", []).append({"question": user_q, "answer": full_answer})
+            print(f"[ask] plan_used={not used_fallback} rows={len(table)}", file=sys.stderr)
             return {"answer": full_answer}
 
+        # === 3) Fallback analyst answer grounded by profile + sample ===
         profile = _df_profile(df)
         sample_csv = _df_sample_csv(df, n=20)
         system_msg = (
@@ -334,8 +421,8 @@ async def ask_question(request: Request):
             ],
         )
         answer = resp["choices"][0]["message"]["content"]
-        sess.setdefault("questions", [])
-        sess["questions"].append({"question": user_q, "answer": answer})
+        sess.setdefault("questions", []).append({"question": user_q, "answer": answer})
+        print(f"[ask] plan_used=False (fallback).", file=sys.stderr)
         return {"answer": answer}
 
     except HTTPException:
