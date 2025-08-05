@@ -1,5 +1,6 @@
-import os, io, json, sys
+import os, io, json, sys, re
 from uuid import uuid4
+from typing import Optional, Dict, Any, List, Tuple
 
 import boto3
 import openai  # legacy SDK 0.28.1 (pinned in requirements)
@@ -12,7 +13,7 @@ from fpdf import FPDF
 # =========================
 # Config
 # =========================
-DEBUG_PLANNER = True          # print plan + columns
+DEBUG_PLANNER = True          # print plan + columns + execution status in logs
 PLANNER_RETRIES = 1           # retry once if invalid JSON
 MAX_PREVIEW_ROWS = 50
 
@@ -46,17 +47,65 @@ s3 = boto3.client(
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # In-memory store (for demo/memory mode)
-session_data = {}
+# session_data[session_id] = {"email": str, "project": str, "questions": list, "files": [s3_keys]}
+session_data: Dict[str, Dict[str, Any]] = {}
 
 # =========================
-# Helpers: load & merge
+# Helpers: normalization & loading
 # =========================
+def _snake(s: str) -> str:
+    s = re.sub(r"[^\w]+", "_", s.strip().lower())
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+LIKELY_DATE_NAMES = {
+    "move_in", "move_in_date", "movein", "start_date",
+    "move_out", "move_out_date", "moveout", "end_date",
+    "date", "start", "end"
+}
+
+def _standardize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize columns, parse likely dates, create unit_size, compute length_of_stay_days."""
+    # 1) snake_case all columns
+    original_cols = list(df.columns)
+    df = df.rename(columns={c: _snake(str(c)) for c in original_cols})
+
+    # 2) parse likely date columns
+    for c in df.columns:
+        if c in LIKELY_DATE_NAMES or "date" in c:
+            try:
+                df[c] = pd.to_datetime(df[c], errors="coerce")
+            except Exception:
+                pass
+
+    # 3) unify unit_size if present under various headers
+    for candidate in ["unit_size", "unitsize", "size", "unit_dimensions"]:
+        if candidate in df.columns:
+            df["unit_size"] = df[candidate].astype(str).str.replace(r"\s+", "", regex=True)
+            break
+
+    # 4) compute length_of_stay_days if we have move-in/out (or start/end)
+    move_in_candidates  = [c for c in df.columns if c in {"move_in", "move_in_date", "movein", "start_date", "start"}]
+    move_out_candidates = [c for c in df.columns if c in {"move_out", "move_out_date", "moveout", "end_date", "end"}]
+    mi = move_in_candidates[0] if move_in_candidates else None
+    mo = move_out_candidates[0] if move_out_candidates else None
+    if mi and mo:
+        today = pd.Timestamp.utcnow().normalize()
+        out = df[mo].fillna(today)
+        try:
+            df["length_of_stay_days"] = (out - df[mi]).dt.days
+        except Exception:
+            df["length_of_stay_days"] = pd.NA
+
+    return df
+
 def _load_df_from_s3_key(s3_client, bucket: str, key: str) -> pd.DataFrame:
     buf = io.BytesIO()
     s3_client.download_fileobj(bucket, key, buf)
     buf.seek(0)
-    # Use openpyxl engine implicitly for .xlsx
-    return pd.read_excel(buf)
+    df = pd.read_excel(buf)  # openpyxl required
+    df = _standardize_df(df)
+    return df
 
 def _load_merged_session_df(s3_client, bucket: str, sess: dict) -> pd.DataFrame:
     keys = sess.get("files", [])
@@ -99,46 +148,39 @@ def _df_profile(df: pd.DataFrame) -> str:
     return "\n".join(parts)
 
 # =========================
-# Column normalization / matching
+# Column aliasing to match planner outputs
 # =========================
 def _normalize(name: str) -> str:
     return "".join(ch for ch in name.strip().lower() if ch.isalnum() or ch == "_")
 
-def _column_alias_map(columns: list[str]) -> dict:
-    """
-    Builds a map normalized_name -> actual_column for fuzzy matching
-    e.g., "Unit Size" -> "unitsize" and also "unit_size" -> "unitsize".
-    """
+def _column_alias_map(columns: List[str]) -> Dict[str, str]:
+    """Map normalized name -> actual column."""
     aliases = {}
     for c in columns:
-        aliases[_normalize(c)] = c
-        aliases[_normalize(c.replace(" ", "_"))] = c
+        norm = _normalize(c)
+        aliases[norm] = c
+        alt = _normalize(c.replace(" ", "_"))
+        aliases[alt] = c
     return aliases
 
-def _remap_plan_columns(plan: dict, alias_map: dict) -> dict:
-    """Remap plan filters/groupby/metrics column names via alias_map if needed."""
-    def map_col(name: str | None) -> str | None:
+def _remap_plan_columns(plan: dict, alias_map: Dict[str, str]) -> dict:
+    """Remap plan filters/groupby/metrics/sort/rank_by to the real columns via alias map."""
+    def map_col(name: Optional[str]) -> Optional[str]:
         if not name:
             return name
-        key = _normalize(name)
-        return alias_map.get(key, name)
+        return alias_map.get(_normalize(name), name)
 
     out = json.loads(json.dumps(plan))  # deep copy
-    # filters
     for f in out.get("filters", []) or []:
         f["column"] = map_col(f.get("column"))
-    # groupby
     if isinstance(out.get("groupby"), list):
         out["groupby"] = [map_col(g) for g in out["groupby"]]
-    # metrics
     for m in out.get("metrics", []) or []:
         m["column"] = map_col(m.get("column"))
-    # sort
     for s in out.get("sort", []) or []:
         s["column"] = map_col(s.get("column"))
-    # rank_by
     if out.get("rank_by"):
-        out["rank_by"] = map_col(out["rank_by"])
+        out["rank_by"] = map_col(out.get("rank_by"))
     return out
 
 # =========================
@@ -147,7 +189,7 @@ def _remap_plan_columns(plan: dict, alias_map: dict) -> dict:
 ALLOWED_AGGS = {"count", "sum", "mean", "avg", "median", "min", "max", "nunique"}
 RENAME_AGG = {"avg": "mean"}
 
-def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
+def _apply_filters(df: pd.DataFrame, filters: List[Dict[str, Any]]) -> pd.DataFrame:
     out = df.copy()
     for f in filters or []:
         col = f.get("column")
@@ -177,7 +219,7 @@ def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
             out = out[(s >= start) & (s <= end)]
     return out
 
-def _execute_plan(df: pd.DataFrame, plan: dict) -> tuple[str, pd.DataFrame | None]:
+def _execute_plan(df: pd.DataFrame, plan: Dict[str, Any]) -> Tuple[str, Optional[pd.DataFrame]]:
     task = (plan.get("task") or "aggregate").lower()
     filters = plan.get("filters") or []
     gby = plan.get("groupby") or []
@@ -187,6 +229,7 @@ def _execute_plan(df: pd.DataFrame, plan: dict) -> tuple[str, pd.DataFrame | Non
 
     work = _apply_filters(df, filters)
 
+    # Ensure numeric
     for m in metrics:
         col = m.get("column")
         if col and col in work.columns:
@@ -197,12 +240,8 @@ def _execute_plan(df: pd.DataFrame, plan: dict) -> tuple[str, pd.DataFrame | Non
         return (f"Showing up to {len(out)} row(s).", out)
 
     if task in ("aggregate", "groupby", "summarize", "summary"):
-        if gby:
-            gb = work.groupby(gby, dropna=False)
-        else:
-            gb = None
-
-        agg_map = {}
+        gb = work.groupby(gby, dropna=False) if gby else None
+        agg_map: Dict[str, List[str]] = {}
         for m in metrics:
             agg = (m.get("agg") or "").lower()
             agg = RENAME_AGG.get(agg, agg)
@@ -242,6 +281,7 @@ def _execute_plan(df: pd.DataFrame, plan: dict) -> tuple[str, pd.DataFrame | Non
             out = gb.agg(agg_map).reset_index()
             out.columns = ["_".join(c).strip() if isinstance(c, tuple) else c for c in out.columns]
             msg = "Computed grouped summary metrics."
+
         if sort:
             for s in sort:
                 out = out.sort_values(by=s["column"], ascending=(s.get("direction","asc")=="asc"))
@@ -263,14 +303,14 @@ def _execute_plan(df: pd.DataFrame, plan: dict) -> tuple[str, pd.DataFrame | Non
 # =========================
 @app.get("/")
 def health():
-    return {"ok": True, "service": "Report Magician backend (debug planner)"}
+    return {"ok": True, "service": "Report Magician backend (debug planner + normalization)"}
 
 @app.post("/api/upload")
 async def upload_excel(
     projectName: str = Form(...),
     email: str = Form(...),
     file: UploadFile = File(...),
-    session_id: str | None = Form(None),
+    session_id: Optional[str] = Form(None),
 ):
     try:
         if not session_id:
@@ -281,7 +321,7 @@ async def upload_excel(
 
         file.file.seek(0)
         s3.upload_fileobj(file.file, BUCKET_NAME, s3_key)
-        s3.head_object(Bucket=BUCKET_NAME, Key=s3_key)  # verify
+        s3.head_object(Bucket=BUCKET_NAME, Key=s3_key)  # verify upload
 
         sess = session_data.setdefault(session_id, {
             "email": email,
@@ -319,17 +359,20 @@ async def ask_question(request: Request):
 
         # Debug: show shape + few rows
         print(f"[ask] session={session_id} merged shape={df.shape}", file=sys.stderr)
-        print("[ask] head:\n" + df.head(5).to_string(index=False), file=sys.stderr)
+        try:
+            print("[ask] head:\n" + df.head(5).to_string(index=False), file=sys.stderr)
+        except Exception:
+            pass
 
-        # Column normalization / aliasing
-        cols = list(df.columns)
-        alias_map = _column_alias_map([c for c in cols if c != "__source_file__"])
+        # Alias map (exclude helper column)
+        cols = [c for c in df.columns if c != "__source_file__"]
+        alias_map = _column_alias_map(cols)
 
         if DEBUG_PLANNER:
             print("[planner] available columns:", cols, file=sys.stderr)
 
-        # === 1) Try to get a JSON plan from the model (with retry) ===
-        def plan_once() -> dict | None:
+        # === Planner (with retry) ===
+        def plan_once() -> Optional[dict]:
             planner_system = (
                 "You are a senior data analyst. Convert the user's question into a SMALL JSON plan "
                 "that can be executed with pandas. Use only these keys: "
@@ -339,17 +382,19 @@ async def ask_question(request: Request):
                 "Filters are case-insensitive for text. If question is descriptive, return task=list_rows. "
                 "IMPORTANT: Return ONLY valid JSON, no backticks, no commentary."
             )
+            # Strong hints for common fields created by normalization
             planner_user = (
                 f"AVAILABLE_COLUMNS = {list(alias_map.values())}\n\n"
+                "NOTES:\n"
+                "- If you need a length-of-stay metric, prefer the numeric column 'length_of_stay_days' if present.\n"
+                "- For unit sizes, use the 'unit_size' column (values like '10x10').\n\n"
                 f"QUESTION = {user_q}\n\n"
                 "Example output:\n"
                 "{\n"
                 '  "task": "aggregate",\n'
-                '  "filters": [{"column":"Unit Size","op":"eq","value":"10x10"}],\n'
-                '  "groupby": ["City"],\n'
-                '  "metrics": [{"agg":"mean","column":"Rent","alias":"avg_rent"}],\n'
-                '  "limit": 50,\n'
-                '  "sort": [{"column":"avg_rent","direction":"desc"}]\n'
+                '  "filters": [{"column":"unit_size","op":"eq","value":"10x10"}],\n'
+                '  "metrics": [{"agg":"mean","column":"length_of_stay_days","alias":"avg_stay_days"}],\n'
+                '  "limit": 50\n'
                 "}"
             )
             resp = openai.ChatCompletion.create(
@@ -378,7 +423,6 @@ async def ask_question(request: Request):
         table = None
         summary_msg = None
         if plan:
-            # Remap column names to real ones (normalize)
             plan = _remap_plan_columns(plan, alias_map)
             if DEBUG_PLANNER:
                 print("[planner] final plan:", json.dumps(plan, indent=2), file=sys.stderr)
@@ -390,7 +434,7 @@ async def ask_question(request: Request):
         else:
             used_fallback = True
 
-        # === 2) If we got a table, answer with preview ===
+        # === If we got a table, return preview ===
         if (table is not None) and (not table.empty):
             preview_rows = min(len(table), MAX_PREVIEW_ROWS)
             csv_preview = table.head(preview_rows).to_csv(index=False)
@@ -400,7 +444,7 @@ async def ask_question(request: Request):
             print(f"[ask] plan_used={not used_fallback} rows={len(table)}", file=sys.stderr)
             return {"answer": full_answer}
 
-        # === 3) Fallback analyst answer grounded by profile + sample ===
+        # === Fallback: grounded analyst answer using profile + sample ===
         profile = _df_profile(df)
         sample_csv = _df_sample_csv(df, n=20)
         system_msg = (
