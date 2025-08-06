@@ -1,7 +1,0 @@
-fastapi
-boto3
-fpdf
-openai==0.28.1
-pandas
-openpyxl
-uvicorn
