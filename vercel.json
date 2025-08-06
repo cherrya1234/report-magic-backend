@@ -1,8 +1,0 @@
-{
-  "builds": [{ "src": "backend_api.py", "use": "@vercel/python" }],
-  "build": {
-    "env": {
-      "PYTHON_VERSION": "3.10"
-    }
-  }
-}
