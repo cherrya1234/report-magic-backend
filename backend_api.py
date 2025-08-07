@@ -1,13 +1,12 @@
-import os
-import json
+import os, io, json, sys, re
 from uuid import uuid4
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple  # Ensure these are imported
 import boto3
 import openai
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse
 from fpdf import FPDF
 
 # =========================
