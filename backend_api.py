@@ -1,4 +1,4 @@
-import os, io, json, sys, re
+Update this import os, io, json, sys, re
 from uuid import uuid4
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -439,7 +439,9 @@ async def ask_question(request: Request):
             preview_rows = min(len(table), MAX_PREVIEW_ROWS)
             csv_preview = table.head(preview_rows).to_csv(index=False)
             answer = summary_msg or "Computed result."
-            full_answer = f"{answer}\n\nPreview (first {preview_rows} rows):\n```\n{csv_preview}\n```"
+            full_answer = f"{answer}\n\nPreview (first {preview_rows} rows):\n
+\n{csv_preview}\n
+"
             sess.setdefault("questions", []).append({"question": user_q, "answer": full_answer})
             print(f"[ask] plan_used={not used_fallback} rows={len(table)}", file=sys.stderr)
             return {"answer": full_answer}
@@ -510,4 +512,14 @@ async def export_pdf(session_id: str):
 
     fname = f"report_{session_id}.pdf"
     pdf.output(fname)
-    return FileResponse(fname, media_type="application/pdf", filename=fname)
+    return FileResponse(fname, media_type="application/pdf", filename=fname) to include @app.get("/api/export")
+def export_pdf():
+    pdf = FPDF()
+    pdf.add_page()
+    font_path = os.path.join("fonts", "DejaVuSans.ttf")
+    pdf.add_font('DejaVu', '', font_path, uni=True)
+    pdf.set_font('DejaVu', '', 12)
+    pdf.cell(200, 10, txt="Sample report with em dash — and unicode ✓", ln=True)
+    fname = "report.pdf"
+    pdf.output(fname)
+    return {"message": f"{fname} generated"}
