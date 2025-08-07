@@ -476,42 +476,26 @@ async def ask_question(request: Request):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"ask failed: {type(e).__name__}: {e}")
-
 @app.get("/api/export")
-async def export_pdf(session_id: str):
-    sess = session_data.get(session_id)
-    if not sess:
-        raise HTTPException(status_code=400, detail="Invalid session_id")
-
-    pdf = FPDF()
+def export_pdf():
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
     pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=12)
 
-    pdf.set_font("Arial", "B", 14)
-    pdf.cell(0, 10, "Report Magician — Q&A Summary", ln=True)
-    pdf.set_font("Arial", size=11)
-    pdf.cell(0, 8, f"Project: {sess.get('project','')}", ln=True)
-    pdf.cell(0, 8, f"Email: {sess.get('email','')}", ln=True)
-    pdf.ln(4)
+    font_path = os.path.join("fonts", "DejaVuSans.ttf")
+    if not os.path.exists(font_path):
+        raise FileNotFoundError("Font file not found at 'fonts/DejaVuSans.ttf'")
 
-    qa_list = sess.get("questions", [])
-    if not qa_list:
-        pdf.set_font("Arial", size=12)
-        pdf.multi_cell(0, 8, "No questions asked in this session.")
-    else:
-        pdf.set_font("Arial", "B", 12)
-        pdf.cell(0, 10, "Q&A", ln=True)
-        pdf.set_font("Arial", size=12)
-        for i, qa in enumerate(qa_list, 1):
-            q = qa.get("question", "")
-            a = qa.get("answer", "")
-            pdf.multi_cell(0, 8, f"{i}. Q: {q}")
-            pdf.multi_cell(0, 8, f"   A: {a}")
-            pdf.ln(2)
-
-    fname = f"report_{session_id}.pdf"
+    pdf.add_font('DejaVu', '', font_path, uni=True)
+    pdf.set_font('DejaVu', '', 12)
+    
+    text = "Sample report with em dash — and unicode ✓"
+    pdf.cell(200, 10, txt=text, ln=True)
+    
+    fname = "report.pdf"
     pdf.output(fname)
+
     return FileResponse(fname, media_type="application/pdf", filename=fname)
+
 def export_pdf():
     pdf = FPDF()
     pdf.add_page()
