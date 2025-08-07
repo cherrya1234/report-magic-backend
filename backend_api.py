@@ -136,19 +136,19 @@ def _df_profile(df: pd.DataFrame) -> str:
         except Exception:
             nulls = 0
         parts.append(f"- {col}: dtype={str(df[col].dtype)}, nulls={nulls}")
+    
     num = df.select_dtypes(include=["number"])
     if not num.empty:
-        parts.append("
-NUMERIC_SUMMARY=" + str(num.describe().round(3).to_dict()))
+        parts.append(f"NUMERIC_SUMMARY={str(num.describe().round(3).to_dict())}")
+    
     cat = df.select_dtypes(exclude=["number"])
     if not cat.empty:
         cats = {}
         for c in cat.columns[:8]:
             cats[c] = cat[c].astype(str).value_counts().head(5).to_dict()
-        parts.append("
-CATEGORICAL_TOP_VALUES=" + str(cats))
-    return "
-".join(parts)
+        parts.append(f"CATEGORICAL_TOP_VALUES={str(cats)}")
+    
+    return "\n".join(parts)
 
 # =========================
 # Plan execution
