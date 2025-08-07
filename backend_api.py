@@ -511,7 +511,7 @@ async def export_pdf(session_id: str):
 
     fname = f"report_{session_id}.pdf"
     pdf.output(fname)
-    return FileResponse(fname, media_type="application/pdf", filename=fname) to include @app.get("/api/export")
+    return FileResponse(fname, media_type="application/pdf", filename=fname)
 def export_pdf():
     pdf = FPDF()
     pdf.add_page()
