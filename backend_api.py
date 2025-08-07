@@ -290,33 +290,21 @@ async def ask_question(request: Request):
                 "IMPORTANT: Return ONLY valid JSON, no backticks, no commentary."
             )
             planner_user = (
-                f"AVAILABLE_COLUMNS = {list(alias_map.values())}
-
-"
-                "QUESTION = {user_q}
-
-"
-                "Example output:
-"
-                "{
-"
-                '  "task": "aggregate",
-'
-                '  "filters": [{"column":"unit_size","op":"eq","value":"10x10"}],
-'
-                '  "metrics": [{"agg":"mean","column":"length_of_stay_days","alias":"avg_stay_days"}],
-'
-                '  "limit": 50
-'
+                f"AVAILABLE_COLUMNS = {list(alias_map.values())}\n\n"
+                f"QUESTION = {user_q}\n\n"
+                "Example output:\n"
+                "{\n"
+                '  "task": "aggregate",\n'
+                '  "filters": [{"column":"unit_size","op":"eq","value":"10x10"}],\n'
+                '  "metrics": [{"agg":"mean","column":"length_of_stay_days","alias":"avg_stay_days"}],\n'
+                '  "limit": 50\n'
                 "}"
             )
             resp = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
                 temperature=0.0,
-                messages=[
-                    {"role": "system", "content": planner_system},
-                    {"role": "user", "content": planner_user},
-                ],
+                messages=[{"role": "system", "content": planner_system},
+                          {"role": "user", "content": planner_user}],
             )
             text = resp["choices"][0]["message"]["content"].strip()
             try:
@@ -344,24 +332,18 @@ async def ask_question(request: Request):
             preview_rows = min(len(table), MAX_PREVIEW_ROWS)
             csv_preview = table.head(preview_rows).to_csv(index=False)
             answer = summary_msg or "Computed result."
-            full_answer = f"{answer}
-
-Preview (first {preview_rows} rows):
-
-{csv_preview}"
+            full_answer = f"{answer}\n\nPreview (first {preview_rows} rows):\n\n{csv_preview}"
             return {"answer": full_answer}
 
         # Fallback answer
         profile = _df_profile(df)
         sample_csv = _df_sample_csv(df, n=20)
         system_msg = "You are a precise data analyst. Use ONLY the provided data profile and sample rows."
-        user_ctx = f"DATA PROFILE:
-{profile}
-
-SAMPLE ROWS (CSV, up to 20):
-{sample_csv}
-
-QUESTION: {user_q}"
+        user_ctx = (
+            f"DATA PROFILE:\n{profile}\n\n"
+            f"SAMPLE ROWS (CSV, up to 20):\n{sample_csv}\n\n"
+            f"QUESTION: {user_q}"
+        )
         resp = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             temperature=0.2,
@@ -369,3 +351,9 @@ QUESTION: {user_q}"
         )
         answer = resp["choices"][0]["message"]["content"]
         return {"answer": answer}
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"ask failed: {type(e).__name__}: {e}")
