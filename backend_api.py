@@ -439,8 +439,7 @@ async def ask_question(request: Request):
             preview_rows = min(len(table), MAX_PREVIEW_ROWS)
             csv_preview = table.head(preview_rows).to_csv(index=False)
             answer = summary_msg or "Computed result."
-            full_answer = f"{answer}\n\nPreview (first {preview_rows} rows):\n
-            \n{csv_preview}\n"
+            full_answer = f"{answer}\n\nPreview (first {preview_rows} rows):\n\n{csv_preview}\n"
 
             sess.setdefault("questions", []).append({"question": user_q, "answer": full_answer})
             print(f"[ask] plan_used={not used_fallback} rows={len(table)}", file=sys.stderr)
