@@ -1,13 +1,13 @@
-import os, io, json, sys, re
+import os
+import json
 from uuid import uuid4
-from typing import Optional, Dict, Any, List, Tuple
-
+from typing import Optional, Dict, Any, List
 import boto3
-import openai  # legacy SDK 0.28.1 (pinned in requirements)
+import openai
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse
 from fpdf import FPDF
 
 # =========================
@@ -112,7 +112,7 @@ def _load_merged_session_df(s3_client, bucket: str, sess: dict) -> pd.DataFrame:
     dfs = []
     for k in keys:
         try:
-            df = _load_df_from_s3_key(s3_client, bucket, k)
+            df = _load_df_from_s3_key(s3, BUCKET_NAME, k)
             df["__source_file__"] = k
             dfs.append(df)
         except Exception as e:
@@ -138,57 +138,21 @@ def _df_profile(df: pd.DataFrame) -> str:
         parts.append(f"- {col}: dtype={str(df[col].dtype)}, nulls={nulls}")
     num = df.select_dtypes(include=["number"])
     if not num.empty:
-        parts.append("\nNUMERIC_SUMMARY=" + str(num.describe().round(3).to_dict()))
+        parts.append("
+NUMERIC_SUMMARY=" + str(num.describe().round(3).to_dict()))
     cat = df.select_dtypes(exclude=["number"])
     if not cat.empty:
         cats = {}
         for c in cat.columns[:8]:
             cats[c] = cat[c].astype(str).value_counts().head(5).to_dict()
-        parts.append("\nCATEGORICAL_TOP_VALUES=" + str(cats))
-    return "\n".join(parts)
+        parts.append("
+CATEGORICAL_TOP_VALUES=" + str(cats))
+    return "
+".join(parts)
 
 # =========================
-# Column aliasing to match planner outputs
+# Plan execution
 # =========================
-def _normalize(name: str) -> str:
-    return "".join(ch for ch in name.strip().lower() if ch.isalnum() or ch == "_")
-
-def _column_alias_map(columns: List[str]) -> Dict[str, str]:
-    """Map normalized name -> actual column."""
-    aliases = {}
-    for c in columns:
-        norm = _normalize(c)
-        aliases[norm] = c
-        alt = _normalize(c.replace(" ", "_"))
-        aliases[alt] = c
-    return aliases
-
-def _remap_plan_columns(plan: dict, alias_map: Dict[str, str]) -> dict:
-    """Remap plan filters/groupby/metrics/sort/rank_by to the real columns via alias map."""
-    def map_col(name: Optional[str]) -> Optional[str]:
-        if not name:
-            return name
-        return alias_map.get(_normalize(name), name)
-
-    out = json.loads(json.dumps(plan))  # deep copy
-    for f in out.get("filters", []) or []:
-        f["column"] = map_col(f.get("column"))
-    if isinstance(out.get("groupby"), list):
-        out["groupby"] = [map_col(g) for g in out["groupby"]]
-    for m in out.get("metrics", []) or []:
-        m["column"] = map_col(m.get("column"))
-    for s in out.get("sort", []) or []:
-        s["column"] = map_col(s.get("column"))
-    if out.get("rank_by"):
-        out["rank_by"] = map_col(out.get("rank_by"))
-    return out
-
-# =========================
-# Safe pandas executor (tiny plan)
-# =========================
-ALLOWED_AGGS = {"count", "sum", "mean", "avg", "median", "min", "max", "nunique"}
-RENAME_AGG = {"avg": "mean"}
-
 def _apply_filters(df: pd.DataFrame, filters: List[Dict[str, Any]]) -> pd.DataFrame:
     out = df.copy()
     for f in filters or []:
@@ -220,83 +184,36 @@ def _apply_filters(df: pd.DataFrame, filters: List[Dict[str, Any]]) -> pd.DataFr
     return out
 
 def _execute_plan(df: pd.DataFrame, plan: Dict[str, Any]) -> Tuple[str, Optional[pd.DataFrame]]:
-    task = (plan.get("task") or "aggregate").lower()
-    filters = plan.get("filters") or []
-    gby = plan.get("groupby") or []
-    metrics = plan.get("metrics") or []
-    limit = int(plan.get("limit") or 50)
-    sort  = plan.get("sort") or []
+    task = plan.get("task", "aggregate").lower()
+    filters = plan.get("filters", [])
+    gby = plan.get("groupby", [])
+    metrics = plan.get("metrics", [])
+    limit = int(plan.get("limit", 50))
+    sort = plan.get("sort", [])
 
+    # Apply filters
     work = _apply_filters(df, filters)
 
-    # Ensure numeric
-    for m in metrics:
-        col = m.get("column")
-        if col and col in work.columns:
-            work[col] = pd.to_numeric(work[col], errors="ignore")
+    # Process the aggregation if required
+    if task == "aggregate":
+        agg_map = {}
+        for metric in metrics:
+            agg_type = metric.get("agg", "mean")
+            col = metric.get("column")
+            agg_map[col] = agg_type
 
-    if task in ("list_rows", "rows"):
-        out = work[gby or work.columns].head(limit)
-        return (f"Showing up to {len(out)} row(s).", out)
+        # Perform aggregation
+        work = work.groupby(gby).agg(agg_map).reset_index()
 
-    if task in ("aggregate", "groupby", "summarize", "summary"):
-        gb = work.groupby(gby, dropna=False) if gby else None
-        agg_map: Dict[str, List[str]] = {}
-        for m in metrics:
-            agg = (m.get("agg") or "").lower()
-            agg = RENAME_AGG.get(agg, agg)
-            col = m.get("column")
-            if agg not in ALLOWED_AGGS:
-                continue
-            if agg == "count" and (not col or col == "*"):
-                if gb is None:
-                    out = pd.DataFrame({"count": [len(work)]})
-                else:
-                    out = gb.size().reset_index(name="count")
-                if sort:
-                    for s in sort:
-                        out = out.sort_values(by=s["column"], ascending=(s.get("direction","asc")=="asc"))
-                return ("Computed counts.", out.head(limit))
-            if col and col in work.columns:
-                agg_map.setdefault(col, []).append(agg)
+    # Apply sorting if requested
+    if sort:
+        for s in sort:
+            work = work.sort_values(by=s["column"], ascending=s.get("direction", "asc") == "asc")
 
-        if not agg_map:
-            if gb is None:
-                out = pd.DataFrame({"count": [len(work)]})
-            else:
-                out = gb.size().reset_index(name="count")
-            if sort:
-                for s in sort:
-                    out = out.sort_values(by=s["column"], ascending=(s.get("direction","asc")=="asc"))
-            return ("Computed counts.", out.head(limit))
+    # Limit the number of rows returned
+    work = work.head(limit)
 
-        if gb is None:
-            out = work.agg(agg_map)
-            if isinstance(out, pd.Series):
-                out = out.to_frame().T
-            else:
-                out.columns = ["_".join(c).strip() if isinstance(c, tuple) else c for c in out.columns]
-            msg = "Computed summary metrics."
-        else:
-            out = gb.agg(agg_map).reset_index()
-            out.columns = ["_".join(c).strip() if isinstance(c, tuple) else c for c in out.columns]
-            msg = "Computed grouped summary metrics."
-
-        if sort:
-            for s in sort:
-                out = out.sort_values(by=s["column"], ascending=(s.get("direction","asc")=="asc"))
-        return (msg, out.head(limit))
-
-    if task in ("topk", "rank"):
-        k = int(plan.get("k") or 10)
-        rank_by = plan.get("rank_by")
-        if rank_by and rank_by in work.columns:
-            out = work.sort_values(by=rank_by, ascending=False).head(k)
-            return (f"Top {k} by {rank_by}.", out)
-        return ("Ranking failed: missing rank_by column.", None)
-
-    out = work.head(limit)
-    return (f"Showing up to {len(out)} row(s).", out)
+    return f"Processed {task} task.", work
 
 # =========================
 # Routes
@@ -357,21 +274,11 @@ async def ask_question(request: Request):
         if df.empty:
             raise HTTPException(status_code=400, detail="Could not load any data from uploaded files.")
 
-        # Debug: show shape + few rows
-        print(f"[ask] session={session_id} merged shape={df.shape}", file=sys.stderr)
-        try:
-            print("[ask] head:\n" + df.head(5).to_string(index=False), file=sys.stderr)
-        except Exception:
-            pass
-
         # Alias map (exclude helper column)
         cols = [c for c in df.columns if c != "__source_file__"]
         alias_map = _column_alias_map(cols)
 
-        if DEBUG_PLANNER:
-            print("[planner] available columns:", cols, file=sys.stderr)
-
-        # === Planner (with retry) ===
+        # Planner (retry logic)
         def plan_once() -> Optional[dict]:
             planner_system = (
                 "You are a senior data analyst. Convert the user's question into a SMALL JSON plan "
@@ -382,19 +289,25 @@ async def ask_question(request: Request):
                 "Filters are case-insensitive for text. If question is descriptive, return task=list_rows. "
                 "IMPORTANT: Return ONLY valid JSON, no backticks, no commentary."
             )
-            # Strong hints for common fields created by normalization
             planner_user = (
-                f"AVAILABLE_COLUMNS = {list(alias_map.values())}\n\n"
-                "NOTES:\n"
-                "- If you need a length-of-stay metric, prefer the numeric column 'length_of_stay_days' if present.\n"
-                "- For unit sizes, use the 'unit_size' column (values like '10x10').\n\n"
-                f"QUESTION = {user_q}\n\n"
-                "Example output:\n"
-                "{\n"
-                '  "task": "aggregate",\n'
-                '  "filters": [{"column":"unit_size","op":"eq","value":"10x10"}],\n'
-                '  "metrics": [{"agg":"mean","column":"length_of_stay_days","alias":"avg_stay_days"}],\n'
-                '  "limit": 50\n'
+                f"AVAILABLE_COLUMNS = {list(alias_map.values())}
+
+"
+                "QUESTION = {user_q}
+
+"
+                "Example output:
+"
+                "{
+"
+                '  "task": "aggregate",
+'
+                '  "filters": [{"column":"unit_size","op":"eq","value":"10x10"}],
+'
+                '  "metrics": [{"agg":"mean","column":"length_of_stay_days","alias":"avg_stay_days"}],
+'
+                '  "limit": 50
+'
                 "}"
             )
             resp = openai.ChatCompletion.create(
@@ -406,8 +319,6 @@ async def ask_question(request: Request):
                 ],
             )
             text = resp["choices"][0]["message"]["content"].strip()
-            if DEBUG_PLANNER:
-                print("[planner] raw plan text:", text, file=sys.stderr)
             try:
                 return json.loads(text)
             except Exception:
@@ -415,8 +326,6 @@ async def ask_question(request: Request):
 
         plan = plan_once()
         if plan is None and PLANNER_RETRIES > 0:
-            if DEBUG_PLANNER:
-                print("[planner] retrying once due to invalid JSON", file=sys.stderr)
             plan = plan_once()
 
         used_fallback = False
@@ -424,85 +333,39 @@ async def ask_question(request: Request):
         summary_msg = None
         if plan:
             plan = _remap_plan_columns(plan, alias_map)
-            if DEBUG_PLANNER:
-                print("[planner] final plan:", json.dumps(plan, indent=2), file=sys.stderr)
             try:
                 summary_msg, table = _execute_plan(df, plan)
-            except Exception as e:
-                print("[planner] execute failed:", repr(e), file=sys.stderr)
+            except Exception:
                 used_fallback = True
         else:
             used_fallback = True
 
-        # === If we got a table, return preview ===
-        if (table is not None) and (not table.empty):
+        if table is not None and not table.empty:
             preview_rows = min(len(table), MAX_PREVIEW_ROWS)
             csv_preview = table.head(preview_rows).to_csv(index=False)
             answer = summary_msg or "Computed result."
-            full_answer = f"{answer}\n\nPreview (first {preview_rows} rows):\n\n{csv_preview}\n"
+            full_answer = f"{answer}
 
-            sess.setdefault("questions", []).append({"question": user_q, "answer": full_answer})
-            print(f"[ask] plan_used={not used_fallback} rows={len(table)}", file=sys.stderr)
+Preview (first {preview_rows} rows):
+
+{csv_preview}"
             return {"answer": full_answer}
 
-        # === Fallback: grounded analyst answer using profile + sample ===
+        # Fallback answer
         profile = _df_profile(df)
         sample_csv = _df_sample_csv(df, n=20)
-        system_msg = (
-            "You are a precise data analyst. Use ONLY the provided data profile and sample rows. "
-            "If data is insufficient, say exactly which columns or steps are needed."
-        )
-        user_ctx = (
-            f"DATA PROFILE:\n{profile}\n\n"
-            f"SAMPLE ROWS (CSV, up to 20):\n{sample_csv}\n\n"
-            f"QUESTION (verbatim from user):\n{user_q}"
-        )
+        system_msg = "You are a precise data analyst. Use ONLY the provided data profile and sample rows."
+        user_ctx = f"DATA PROFILE:
+{profile}
+
+SAMPLE ROWS (CSV, up to 20):
+{sample_csv}
+
+QUESTION: {user_q}"
         resp = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             temperature=0.2,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_ctx},
-            ],
+            messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_ctx}],
         )
         answer = resp["choices"][0]["message"]["content"]
-        sess.setdefault("questions", []).append({"question": user_q, "answer": answer})
-        print(f"[ask] plan_used=False (fallback).", file=sys.stderr)
         return {"answer": answer}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"ask failed: {type(e).__name__}: {e}")
-@app.get("/api/export")
-def export_pdf():
-    pdf = FPDF(orientation="P", unit="mm", format="A4")
-    pdf.add_page()
-
-    font_path = os.path.join("fonts", "DejaVuSans.ttf")
-    if not os.path.exists(font_path):
-        raise FileNotFoundError("Font file not found at 'fonts/DejaVuSans.ttf'")
-
-    pdf.add_font('DejaVu', '', font_path, uni=True)
-    pdf.set_font('DejaVu', '', 12)
-    
-    text = "Sample report with em dash — and unicode ✓"
-    pdf.cell(200, 10, txt=text, ln=True)
-    
-    fname = "report.pdf"
-    pdf.output(fname)
-
-    return FileResponse(fname, media_type="application/pdf", filename=fname)
-
-def export_pdf():
-    pdf = FPDF()
-    pdf.add_page()
-    font_path = os.path.join("fonts", "DejaVuSans.ttf")
-    pdf.add_font('DejaVu', '', font_path, uni=True)
-    pdf.set_font('DejaVu', '', 12)
-    pdf.cell(200, 10, txt="Sample report with em dash — and unicode ✓", ln=True)
-    fname = "report.pdf"
-    pdf.output(fname)
-    return {"message": f"{fname} generated"}
