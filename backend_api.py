@@ -1,6 +1,6 @@
 import os, io, json, sys, re
 from uuid import uuid4
-from typing import Optional, Dict, Any, List, Tuple  # Ensure these are imported
+from typing import Optional, Dict, Any, List, Tuple
 import boto3
 import openai
 import pandas as pd
@@ -245,6 +245,37 @@ def _execute_plan(df: pd.DataFrame, plan: Dict[str, Any]) -> Tuple[str, Optional
     return f"Processed {task} task.", work
 
 # =========================
+# Helper function to create PDF from DataFrame
+# =========================
+def df_to_pdf(df: pd.DataFrame, title: str) -> str:
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # Title
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(200, 10, txt=title, ln=True, align='C')
+
+    # Table Header
+    pdf.set_font("Arial", 'B', 10)
+    for col in df.columns:
+        pdf.cell(40, 10, txt=col, border=1, align='C')
+    pdf.ln()
+
+    # Table Rows
+    pdf.set_font("Arial", size=10)
+    for index, row in df.iterrows():
+        for value in row:
+            pdf.cell(40, 10, txt=str(value), border=1, align='C')
+        pdf.ln()
+
+    # Save PDF to a file
+    output_pdf_path = f"/tmp/{title}.pdf"
+    pdf.output(output_pdf_path)
+
+    return output_pdf_path
+
+# =========================
 # Routes
 # =========================
 @app.get("/")
@@ -284,6 +315,30 @@ async def upload_excel(
     except Exception as e:
         print("Upload error:", repr(e), file=sys.stderr)
         raise HTTPException(status_code=500, detail="Upload failed.")
+
+@app.get("/api/export")
+async def export_report(session_id: str, project_name: str, email: str):
+    try:
+        # Fetch session data
+        sess = session_data.get(session_id)
+        if not sess or not sess.get("files"):
+            raise HTTPException(status_code=400, detail="No files found for this session.")
+
+        # Load the merged dataframe from S3
+        df = _load_merged_session_df(s3, BUCKET_NAME, sess)
+        if df.empty:
+            raise HTTPException(status_code=400, detail="Could not load any data from uploaded files.")
+
+        # Export as PDF using the helper function
+        pdf_file_path = df_to_pdf(df, f"{project_name}_report")
+
+        # Return the PDF file as a download
+        return FileResponse(pdf_file_path, media_type='application/pdf', filename=f"{project_name}_report.pdf")
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Export failed: {type(e).__name__}: {e}")
 
 @app.post("/api/ask")
 async def ask_question(request: Request):
@@ -382,7 +437,11 @@ async def ask_question(request: Request):
         return {"answer": answer}
     except HTTPException:
         raise
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"ask failed: {type(e).__name__}: {e}")
+    except
+
+
+
+
+
+
+
