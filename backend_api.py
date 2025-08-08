@@ -340,6 +340,7 @@ async def export_report(session_id: str, project_name: str, email: str):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Export failed: {type(e).__name__}: {e}")
 
+
 @app.post("/api/ask")
 async def ask_question(request: Request):
     try:
@@ -350,52 +351,30 @@ async def ask_question(request: Request):
         if not session_id or not user_q:
             raise HTTPException(status_code=400, detail="Missing session_id or prompt.")
 
+        # Fetch session data
         sess = session_data.get(session_id)
         if not sess or not sess.get("files"):
             raise HTTPException(status_code=400, detail="No files found for this session.")
 
+        # Load the merged dataframe from S3
         df = _load_merged_session_df(s3, BUCKET_NAME, sess)
         if df.empty:
             raise HTTPException(status_code=400, detail="Could not load any data from uploaded files.")
 
-        # Alias map (exclude helper column)
+        # Alias map and planner logic
         cols = [c for c in df.columns if c != "__source_file__"]
         alias_map = _column_alias_map(cols)
 
-        # Planner (retry logic)
-        def plan_once() -> Optional[dict]:
-            planner_system = (
-                "You are a senior data analyst. Convert the user's question into a SMALL JSON plan "
-                "that can be executed with pandas. Use only these keys: "
-                "task, filters, groupby, metrics, limit, sort, k, rank_by. "
-                "Allowed tasks: aggregate, list_rows, topk. "
-                "Allowed aggs: count, sum, mean, avg, median, min, max, nunique. "
-                "Filters are case-insensitive for text. If question is descriptive, return task=list_rows. "
-                "IMPORTANT: Return ONLY valid JSON, no backticks, no commentary."
-            )
-            planner_user = (
-                f"AVAILABLE_COLUMNS = {list(alias_map.values())}\n\n"
-                f"QUESTION = {user_q}\n\n"
-                "Example output:\n"
-                "{\n"
-                '  "task": "aggregate",\n'
-                '  "filters": [{"column":"unit_size","op":"eq","value":"10x10"}],\n'
-                '  "metrics": [{"agg":"mean","column":"length_of_stay_days","alias":"avg_stay_days"}],\n'
-                '  "limit": 50\n'
-                "}"
-            )
-            resp = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                temperature=0.0,
-                messages=[{"role": "system", "content": planner_system},
-                          {"role": "user", "content": planner_user}],
-            )
-            text = resp["choices"][0]["message"]["content"].strip()
-            try:
-                return json.loads(text)
-            except Exception:
-                return None
+        # Planner system: Detect if the user asks for a PDF export
+        if "list of all tenants" in user_q.lower():
+            # Automatically generate the PDF without manual intervention
+            df_filtered = df[['sfname', 'slname', 'semail', 'sphone']].dropna()  # Filter the relevant columns
+            pdf_file_path = df_to_pdf(df_filtered, f"Tenant List_{session_id}")
 
+            # Return the generated PDF
+            return FileResponse(pdf_file_path, media_type='application/pdf', filename=f"Tenant_List_{session_id}.pdf")
+        
+        # Existing question answering system:
         plan = plan_once()
         if plan is None and PLANNER_RETRIES > 0:
             plan = plan_once()
@@ -435,14 +414,13 @@ async def ask_question(request: Request):
         )
         answer = resp["choices"][0]["message"]["content"]
         return {"answer": answer}
+
     except HTTPException:
         raise
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"ask failed: {type(e).__name__}: {e}")
-
-
 
 
 
