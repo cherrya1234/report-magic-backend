@@ -156,26 +156,29 @@ def _column_alias_map(columns: List[str]) -> Dict[str, str]:
     """Map normalized name -> actual column."""
     aliases = {}
 
+    # Define specific column aliases
     column_aliases = {
         "sfname": "First Name",
         "slname": "Last Name",
         "semail": "Email Address",
         "sphone": "Phone Number"
     }
-    
-    for c in columns:
 
-     if c in column_aliases:
+    # Iterate through the columns and map accordingly
+    for c in columns:
+        # Check if the column has a predefined alias
+        if c in column_aliases:
+            # Add the normalized and underscored versions to the aliases map
             aliases[column_aliases[c].lower()] = c
             aliases[_normalize(column_aliases[c].replace(" ", "_")).lower()] = c
-        
-        # Then, add the dynamic normalized/alternative mappings
+
+        # Then, handle dynamic normalized/alternative mappings
         norm = _normalize(c).lower()  # Normalize column name
         aliases[norm] = c
         alt = _normalize(c.replace(" ", "_")).lower()  # Normalize and replace spaces with underscores
         aliases[alt] = c
-    
-    return aliases   
+
+    return aliases
     
         
 
