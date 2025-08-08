@@ -149,9 +149,39 @@ def _df_profile(df: pd.DataFrame) -> str:
     
     return "\n".join(parts)
 
-# =========================
-# Plan execution
-# =========================
+def _normalize(name: str) -> str:
+    return "".join(ch for ch in name.strip().lower() if ch.isalnum() or ch == "_")
+
+def _column_alias_map(columns: List[str]) -> Dict[str, str]:
+    """Map normalized name -> actual column."""
+    aliases = {}
+    for c in columns:
+        norm = _normalize(c)
+        aliases[norm] = c
+        alt = _normalize(c.replace(" ", "_"))
+        aliases[alt] = c
+    return aliases
+
+def _remap_plan_columns(plan: dict, alias_map: Dict[str, str]) -> dict:
+    """Remap plan filters/groupby/metrics/sort/rank_by to the real columns via alias map."""
+    def map_col(name: Optional[str]) -> Optional[str]:
+        if not name:
+            return name
+        return alias_map.get(_normalize(name), name)
+
+    out = json.loads(json.dumps(plan))  # deep copy
+    for f in out.get("filters", []) or []:
+        f["column"] = map_col(f.get("column"))
+    if isinstance(out.get("groupby"), list):
+        out["groupby"] = [map_col(g) for g in out["groupby"]]
+    for m in out.get("metrics", []) or []:
+        m["column"] = map_col(m.get("column"))
+    for s in out.get("sort", []) or []:
+        s["column"] = map_col(s.get("column"))
+    if out.get("rank_by"):
+        out["rank_by"] = map_col(out.get("rank_by"))
+    return out
+
 def _apply_filters(df: pd.DataFrame, filters: List[Dict[str, Any]]) -> pd.DataFrame:
     out = df.copy()
     for f in filters or []:
