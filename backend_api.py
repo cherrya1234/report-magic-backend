@@ -366,18 +366,18 @@ async def ask_question(request: Request):
         alias_map = _column_alias_map(cols)
 
         # Planner system: Detect if the user asks for a PDF export
-        if "list of all tenants" in user_q.lower():
+        if "list of all tenants" in user_q.lower() or "tenant list" in user_q.lower():
             # Automatically generate the PDF without manual intervention
             df_filtered = df[['sfname', 'slname', 'semail', 'sphone']].dropna()  # Filter the relevant columns
-            pdf_file_path = df_to_pdf(df_filtered, f"Tenant List_{session_id}")
+            pdf_file_path = create_pdf_from_data(df_filtered, f"Tenant_List_{session_id}")
 
-            # Return the generated PDF
+            # Return the generated PDF as a downloadable file
             return FileResponse(pdf_file_path, media_type='application/pdf', filename=f"Tenant_List_{session_id}.pdf")
-        
-        # Existing question answering system:
-        plan = plan_once()
+
+        # Planner logic for other questions
+        plan = plan_once(df, alias_map, user_q)  # Ensure that plan_once is called correctly with needed arguments
         if plan is None and PLANNER_RETRIES > 0:
-            plan = plan_once()
+            plan = plan_once(df, alias_map, user_q)
 
         used_fallback = False
         table = None
@@ -414,7 +414,6 @@ async def ask_question(request: Request):
         )
         answer = resp["choices"][0]["message"]["content"]
         return {"answer": answer}
-
     except HTTPException:
         raise
     except Exception as e:
@@ -422,6 +421,36 @@ async def ask_question(request: Request):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"ask failed: {type(e).__name__}: {e}")
 
-
-
-
+def plan_once(df: pd.DataFrame, alias_map: Dict[str, str], user_q: str) -> Optional[dict]:
+    """ Generate the plan for executing a user query based on available columns and filters. """
+    planner_system = (
+        "You are a senior data analyst. Convert the user's question into a SMALL JSON plan "
+        "that can be executed with pandas. Use only these keys: "
+        "task, filters, groupby, metrics, limit, sort, k, rank_by. "
+        "Allowed tasks: aggregate, list_rows, topk. "
+        "Allowed aggs: count, sum, mean, avg, median, min, max, nunique. "
+        "Filters are case-insensitive for text. If question is descriptive, return task=list_rows. "
+        "IMPORTANT: Return ONLY valid JSON, no backticks, no commentary."
+    )
+    planner_user = (
+        f"AVAILABLE_COLUMNS = {list(alias_map.values())}\n\n"
+        f"QUESTION = {user_q}\n\n"
+        "Example output:\n"
+        "{\n"
+        '  "task": "aggregate",\n'
+        '  "filters": [{"column":"unit_size","op":"eq","value":"10x10"}],\n'
+        '  "metrics": [{"agg":"mean","column":"length_of_stay_days","alias":"avg_stay_days"}],\n'
+        '  "limit": 50\n'
+        "}"
+    )
+    resp = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        temperature=0.0,
+        messages=[{"role": "system", "content": planner_system},
+                  {"role": "user", "content": planner_user}],
+    )
+    text = resp["choices"][0]["message"]["content"].strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
