@@ -155,12 +155,29 @@ def _normalize(name: str) -> str:
 def _column_alias_map(columns: List[str]) -> Dict[str, str]:
     """Map normalized name -> actual column."""
     aliases = {}
+
+    column_aliases = {
+        "sfname": "First Name",
+        "slname": "Last Name",
+        "semail": "Email Address",
+        "sphone": "Phone Number"
+    }
+    
     for c in columns:
-        norm = _normalize(c)
+
+     if c in column_aliases:
+            aliases[column_aliases[c].lower()] = c
+            aliases[_normalize(column_aliases[c].replace(" ", "_")).lower()] = c
+        
+        # Then, add the dynamic normalized/alternative mappings
+        norm = _normalize(c).lower()  # Normalize column name
         aliases[norm] = c
-        alt = _normalize(c.replace(" ", "_"))
+        alt = _normalize(c.replace(" ", "_")).lower()  # Normalize and replace spaces with underscores
         aliases[alt] = c
-    return aliases
+    
+    return aliases   
+    
+        
 
 def _remap_plan_columns(plan: dict, alias_map: Dict[str, str]) -> dict:
     """Remap plan filters/groupby/metrics/sort/rank_by to the real columns via alias map."""
